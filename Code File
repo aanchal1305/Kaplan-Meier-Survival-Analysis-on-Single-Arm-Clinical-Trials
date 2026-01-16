@@ -1,0 +1,269 @@
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(survival)
+library(survminer)
+
+# Load data (Update path as needed)
+data <-
+read.csv("C:\\Users\\jaisi\\Downloads\\NMIMS_Hackathon26_Dataset.csv", header
+= TRUE, stringsAsFactors = FALSE)
+
+# Convert dates and handle blanks
+data <- data %>%
+mutate(
+recruitment_date = as.Date(recruitment_date),
+event_or_withdrawal_date = as.Date(event_or_withdrawal_date),
+reason = ifelse(trimws(reason) == "", NA, reason) # Handle empty strings
+)
+
+# Define study cutoff
+cutoff <- as.Date("2024-01-01")
+
+# Create Event Indicator & Logic
+data <- data %>%
+mutate(
+# 1 if Progression/Death, 0 otherwise
+event = case_when(
+!is.na(event_or_withdrawal_date) &
+grepl("progression|death", reason, ignore.case = TRUE) ~ 1,
+TRUE ~ 0)
+
+# Determine last observed date (Event/Withdrawal date OR Cutoff)
+last_date = case_when(
+!is.na(event_or_withdrawal_date) ~ event_or_withdrawal_date,
+TRUE ~ cutoff)
+
+# Calculate Time in Months (using 30.44 days per month avg)
+time_months = as.numeric(difftime(last_date, recruitment_date, units =
+"days")) / 30.44)
+
+# Create Detailed Outcome Categories for EDA
+data <- data %>%
+mutate(outcome_cat = case_when(
+event == 1 & grepl("death", reason, ignore.case = TRUE) ~ "Death",
+event == 1 & grepl("progression", reason, ignore.case = TRUE) ~ "Disease Progression",
+event == 0 & !is.na(reason) ~ "Withdrawal",
+event == 0 & is.na(reason) ~ "Event-free at Cut-off",
+TRUE ~ "Other Censoring"))
+
+############################################
+# 2. EXPLORATORY DATA ANALYSIS (EDA)
+############################################
+
+# --- EDA A: Detailed Outcome Distribution Table ---
+outcome_summary <- data %>%
+count(outcome_cat) %>%
+mutate(percent = round(n / sum(n) * 100, 1))
+print("Outcome Summary:")
+
+# --- EDA B: Visualization of Patient Outcomes (Bar Chart) ---
+ggplot(outcome_summary, aes(x = reorder(outcome_cat, -percent), y = percent))
++
+geom_bar(stat = "identity", width = 0.6, fill = "#4E79A7") +
+geom_text(aes(label = paste0(percent, "%")), vjust = -0.4, fontface =
+"bold") +
+labs(
+title = "Patient Outcomes During Follow-up",
+subtitle = "Single-arm study (N = 200)",
+x = "Outcome Category",
+y = "Percentage of Patients (%)"
+) +
+scale_y_continuous(limits = c(0, 65)) +
+theme_minimal(base_size = 13) +
+theme(
+plot.title = element_text(face = "bold", hjust = 0.5),
+plot.subtitle = element_text(hjust = 0.5),
+panel.grid.major.x = element_blank())
+
+# --- EDA C: Distribution of Follow-up Time (Histogram) ---
+# This proves "administrative censoring" (peaks at 24-48 months)
+ggplot(data, aes(x = time_months)) +
+geom_histogram(bins = 20, fill = "#4E79A7", color = "white", alpha = 0.9) +
+labs(
+title = "Distribution of Follow-up Time",
+subtitle = "Observed time to event or censoring",
+x = "Follow-up time (months)",
+y = "Number of patients"
+) +
+scale_x_continuous(breaks = seq(0, 48, by = 6)) +
+theme_minimal(base_size = 13) +
+theme(
+plot.title = element_text(face = "bold", hjust = 0.5),
+plot.subtitle = element_text(hjust = 0.5)
+)
+
+############################################
+# 3. SURVIVAL ANALYSIS (Kaplan-Meier)
+############################################
+# Fit the KM Model
+km_fit <- survfit(Surv(time_months, event) ~ 1, data = data)
+# Plot KM Curve with Risk Table
+ggsurvplot(
+km_fit,
+data = data,
+conf.int = TRUE,
+palette = "#2C7BB6",
+xlab = "Time since recruitment (months)",
+ylab = "Event-free survival (%)",
+title = "Kaplan–Meier Event-Free Survival Curve",
+risk.table = TRUE, # Adds the risk table
+risk.table.height = 0.25,
+ggtheme = theme_minimal()
+)
+
+# Extract 24-Month Survival Probability
+km_24 <- summary(km_fit, times = 24)
+surv_prob <- km_24$surv
+std_err <- km_24$std.err
+cat("\n===== PRIMARY ENDPOINT RESULTS =====\n")
+
+## ===== PRIMARY ENDPOINT RESULTS =====
+cat("24-Month Event-Free Survival:", round(surv_prob * 100, 1), "%\n")
+
+## 24-Month Event-Free Survival: 75.4 %
+cat("Standard Error:", round(std_err, 4), "\n")
+## Standard Error: 0.0315
+cat("95% CI: [", round(km_24$lower * 100, 1), "%, ", round(km_24$upper * 100,
+1), "%]\n")
+## 95% CI: [ 69.5 %, 81.9 %]
+
+############################################
+# 4. HYPOTHESIS TESTING (Z-Test)
+############################################
+
+# Null Hypothesis: S(24) <= 50%
+# Alternative: S(24) > 50%
+S0 <- 0.50 # Standard of Care
+Z_score <- (surv_prob - S0) / std_err
+p_value <- 1 - pnorm(Z_score)
+cat("\n===== STATISTICAL TEST =====\n")
+
+## ===== STATISTICAL TEST =====
+cat("Z-Score:", round(Z_score, 3), "\n")
+## Z-Score: 8.074
+cat("One-sided P-value:", format.pval(p_value, digits=4), "\n")
+## One-sided P-value: 3.331e-16
+if(p_value < 0.05) {
+cat("CONCLUSION: Reject Null Hypothesis. The study drug is significantly
+better than Standard of Care.\n")
+} else {
+cat("CONCLUSION: Fail to Reject Null Hypothesis.\n")
+}
+## CONCLUSION: Reject Null Hypothesis. The study drug is significantly better
+than Standard of Care.
+
+# ===============
+# Exercise 2
+# ==============================================================
+# ==============================================================
+# 5. SIMULATION STUDY (EXERCISE 2)
+# ==============================================================
+
+# Simulation Function
+one_simulation <- function(k) {
+# Parameters
+N <- 200
+S24_true <- 0.60
+entry_end <- 24
+study_end <- 48
+dropout_rate <- -log(0.95) / 12
+# 1. Generate Entry Times (Uniform)
+entry_time <- runif(N, 0, entry_end)
+admin_time <- study_end - entry_time # Max time available for observation
+# 2. Generate Event Times (Weibull)
+# Calibrate lambda so that S(24) = 0.60 for given shape k
+lambda <- (-log(S24_true))^(1 / k) / 24
+event_time <- rweibull(N, shape = k, scale = 1 / lambda)
+# 3. Generate Dropout Times (Exponential)
+dropout_time <- rexp(N, rate = dropout_rate)
+# 4. Determine Observed Data
+# Time is min of Event, Dropout, or Admin censoring
+time <- pmin(event_time, dropout_time, admin_time)
+event <- as.integer(event_time <= pmin(dropout_time, admin_time))
+# Track counts for validation
+event_count <- sum(event == 1)
+dropout_count <- sum(dropout_time < event_time & dropout_time <=
+admin_time)
+admin_count <- sum(admin_time < event_time & admin_time < dropout_time)
+# 5. Analyze Simulated Data
+km_sim <- survfit(Surv(time, event) ~ 1)
+km24_sim <- summary(km_sim, times = 24, extend = TRUE)
+# 6. Hypothesis Test (vs Standard of Care 40%)
+# Note: Standard of Care is 40% for Liver Cancer (Exercise 2)
+Z_sim <- (km24_sim$surv - 0.40) / km24_sim$std.err
+p_sim <- 1 - pnorm(Z_sim)
+return(c(
+surv24 = km24_sim$surv,
+lower = km24_sim$lower,
+upper = km24_sim$upper,
+events = event_count,
+
+dropouts = dropout_count,
+admin = admin_count,
+pvalue = p_sim
+))
+}
+# --- RUN SIMULATION ---
+set.seed(123) # Ensure reproducibility
+nsim <- 10000
+cat("\n===== EXERCISE 2: RUNNING SIMULATIONS... =====\n")
+##
+## ===== EXERCISE 2: RUNNING SIMULATIONS... =====
+# Case 1: Decreasing Hazard (k = 0.7)
+res_k07 <- replicate(nsim, one_simulation(k = 0.7))
+# Case 2: Constant Hazard (k = 1.0) - PRIMARY CASE
+res_k10 <- replicate(nsim, one_simulation(k = 1.0))
+# Case 3: Increasing Hazard (k = 1.3)
+res_k13 <- replicate(nsim, one_simulation(k = 1.3))
+# --- SUMMARIZE RESULTS ---
+# Corrected function: Uses MEAN for Power (Probability)
+summarize_results <- function(res) {
+data.frame(
+Avg_Survival_24 = mean(res["surv24", ]),
+Avg_Events = mean(res["events", ]),
+Avg_Dropouts = mean(res["dropouts", ]),
+Avg_AdminCensor = mean(res["admin", ]),
+POWER = mean(res["pvalue", ] < 0.05) # Proportion of
+significant trials
+)
+}
+cat("\n--- SIMULATION RESULTS (Power Analysis) ---\n")
+
+cat("\n--- SIMULATION RESULTS (Power Analysis) ---\n")
+##
+## --- SIMULATION RESULTS (Power Analysis) ---
+cat("Case 1 (k=0.7):\n")
+print(summarize_results(res_k07))
+
+cat("\nCase 2 (k=1.0, Exponential - Primary Assumption):\n")
+print(summarize_results(res_k10))
+
+cat("\nCase 3 (k=1.3):\n")
+print(summarize_results(res_k13))
+
+# ==============================================================
+# 6. VISUALIZATION OF ASSUMPTIONS (HAZARD PLOT)
+# ==============================================================
+t <- seq(0, 60, by = 0.1)
+S24_target <- 0.60
+# Hazard Functions for Visualization
+lambda_func <- function(k) (-log(S24_target))^(1 / k) / 24
+haz_07 <- (0.7 / (1 / lambda_func(0.7))) * (t / (1 / lambda_func(0.7)))^(0.7
+- 1)
+haz_10 <- rep(-log(S24_target) / 24, length(t))
+haz_13 <- (1.3 / (1 / lambda_func(1.3))) * (t / (1 / lambda_func(1.3)))^(1.3
+- 1)
+plot(t, haz_07, type = "l", lwd = 2, col="blue", ylim=c(0, 0.05),
+xlab = "Time (months)", ylab = "Hazard Rate",
+main = "Simulation Assumptions: Hazard Rate Functions")
+lines(t, haz_10, lwd = 2, col="black", lty = 2)
+lines(t, haz_13, lwd = 2, col="red", lty = 3)
+legend("topright",
+legend = c("Decreasing (k=0.7)", "Constant (k=1.0)", "Increasing
+(k=1.3)"),
+col = c("blue", "black", "red"),
+lty = c(1,2,3), lwd = 2)
+cat("\nScript Completed.\n")  
+
+#Plz note: There might be some code errors during pasting the code.
